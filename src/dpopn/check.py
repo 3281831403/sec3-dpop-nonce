@@ -78,7 +78,11 @@ def check_nonce(
     if (
         not isinstance(store, dict)
         or not isinstance(nonce, str)
+        or not nonce
         or not isinstance(client, str)
+        or not client
+        or isinstance(now, bool)
+        or not isinstance(now, (int, float))
     ):
         return False
 
@@ -90,7 +94,18 @@ def check_nonce(
         return False
     if record.get("used"):
         return False
+    if record.get("client") != client:
+        return False
 
+    expires_at = record.get("expires_at")
+    if (
+        not isinstance(expires_at, (int, float))
+        or isinstance(expires_at, bool)
+        or now > expires_at
+    ):
+        return False
+
+    record["used"] = True
     return True
 
 
@@ -99,7 +114,12 @@ def check_echo(payload: dict[str, Any], nonce: str) -> bool:
 
     if not isinstance(payload, dict):
         return False
-    return bool(payload.get("nonce"))
+    echoed = payload.get("nonce")
+    if not isinstance(echoed, str) or not echoed:
+        return False
+    if not isinstance(nonce, str) or not nonce:
+        return False
+    return hmac.compare_digest(echoed.encode("utf-8"), nonce.encode("utf-8"))
 
 
 def check_htm_htu(payload: dict[str, Any], method: str, url: str) -> bool:
@@ -115,7 +135,7 @@ def check_htm_htu(payload: dict[str, Any], method: str, url: str) -> bool:
     htu = payload.get("htu")
     if not all(isinstance(value, str) and value for value in (htm, htu, method, url)):
         return False
-    return htm.upper().startswith(method.upper()) and htu.startswith(url)
+    return htm.upper() == method.upper() and htu == url
 
 
 def check_jti(
@@ -151,6 +171,10 @@ def check_jti(
         ):
             jtis.pop(seen_jti, None)
 
+    if jti in jtis:
+        return False
+
+    jtis[jti] = now + ttl
     return True
 
 
@@ -169,13 +193,19 @@ def check_ath(payload: dict[str, Any], access_token: str) -> bool:
     ath = payload.get("ath")
     if not isinstance(ath, str) or not ath:
         return False
-    if payload.get("ath_alg") is None:
-        return True
+    alg = payload.get("ath_alg")
+    if alg is None:
+        hasher = _ATH_HASHES["sha-256"]
+    else:
+        if not isinstance(alg, str):
+            return False
+        hasher = _ATH_HASHES.get(alg.lower())
+        if hasher is None:
+            return False
 
-    hasher = _ATH_HASHES["sha-256"]
     digest = hasher(access_token.encode("utf-8")).digest()
     expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-    return hmac.compare_digest(expected, ath)
+    return hmac.compare_digest(expected.encode("ascii"), ath.encode("utf-8"))
 
 
 def validate_policy(policy: dict[str, Any]) -> list[str]:
@@ -189,6 +219,8 @@ def validate_policy(policy: dict[str, Any]) -> list[str]:
         return ["policy must be a mapping"]
 
     problems: list[str] = []
+    if not policy.get("nonce_required"):
+        problems.append("nonce is not required")
     if not policy.get("nonce_one_time"):
         problems.append("nonce is not one-time")
     if not policy.get("ath_required"):
@@ -216,11 +248,6 @@ def proof_batch(
     results: list[dict[str, Any]] = []
     accepted: list[int] = []
     rejected: list[int] = []
-    shared_nonce = (
-        requests[0].get("nonce")
-        if requests and isinstance(requests[0], dict)
-        else None
-    )
 
     for index, request in enumerate(requests):
         errors: list[str] = []
@@ -228,7 +255,7 @@ def proof_batch(
             errors.append("request must be a mapping")
         else:
             payload = request.get("payload")
-            nonce = shared_nonce
+            nonce = request.get("nonce")
             client = request.get("client")
             method = request.get("method")
             url = request.get("url")
